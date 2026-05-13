@@ -1768,16 +1768,6 @@ fn get_detailed_monitors_internal(_verbose: bool) -> Vec<MonitorInfo> {
         }
     }
 
-    // 3. 메인 모니터 및 특정 모니터 필터링
-    let _my_name = std::env::var("USERNAME").unwrap_or_default();
-    results.retain(|m| {
-        // 메인 모니터(사용자가 지정한 이름) 제외
-        if m._name.contains("JtnCw8iKfGVx$") {
-            return false;
-        }
-        // 기본 모니터 필터링 예시
-        true
-    });
     results
 }
 
