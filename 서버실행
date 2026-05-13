@@ -1,0 +1,14 @@
+끄기: screen -S remoter_server -X quit
+업데이트: cd ~/dual_window_server && git pull origin master
+다시 켜기: screen -dmS remoter_server cargo run --release
+
+
+
+# 1. 끄기
+screen -S remoter_server -X quit
+
+# 2. 강제 업데이트
+cd ~/dual_window_server && git fetch origin master && git reset --hard origin/master
+
+# 3. 다시 켜기
+screen -dmS remoter_server cargo run --release

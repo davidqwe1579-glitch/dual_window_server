@@ -1,0 +1,29 @@
+[package]
+name = "dual_window"
+version = "0.1.0"
+edition = "2024"
+default-run = "dual_window"
+
+[dependencies]
+eframe = "0.27.0"
+egui = "0.27.0"
+windows = { version = "0.56.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dxgi", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_UI_Accessibility", "Win32_System_Console", "Win32_UI_Shell", "Win32_System_Memory", "Win32_UI_HiDpi"] }
+image = "0.25"
+windows-capture = "1.5.0"
+crossbeam-channel = "0.5"
+rfd = "0.14"
+once_cell = "1.19"
+cpal = "0.17.3"
+ringbuf = "0.5.0"
+wasapi = "0.17"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+chrono = "0.4"
+
+[profile.dev]
+opt-level = 3
+# 외부 라이브러리도 최적화 적용
+[profile.dev.package."*"]
+opt-level = 3

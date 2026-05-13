@@ -1,0 +1,37 @@
+@echo off
+setlocal
+title ASTER Worker Restart for 'come'
+
+echo [*] Checking Administrator privileges...
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo [!] Run as Administrator.
+    pause
+    exit /b
+)
+
+echo.
+echo [*] Killing existing worker...
+taskkill /f /im dual_window.exe >nul 2>&1
+
+timeout /t 2 >nul
+
+echo.
+echo [*] Logging off current 'come' session...
+
+for /f "skip=1 tokens=3" %%s in ('query user come') do (
+    logoff %%s
+)
+
+timeout /t 3 >nul
+
+echo.
+echo [*] Starting worker as 'come' user...
+
+echo [*] Copying the latest executable to Public directory...
+copy /y "%~dp0target\release\dual_window.exe" "C:\Users\Public\dual_window.exe"
+
+echo.
+echo [V] Done.
+echo The 'come' session will auto-login via ASTER and run the worker automatically!
+pause
