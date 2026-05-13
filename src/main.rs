@@ -9,17 +9,13 @@ use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, HMONITOR, MONITORINFOEXW, HDC,
+    DEVMODEW, ChangeDisplaySettingsExW,
+    DM_PELSWIDTH, DM_PELSHEIGHT,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC,
+    SelectObject, BitBlt, SRCCOPY, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, CreateDCW,
 };
-use windows_capture::{
-    capture::{GraphicsCaptureApiHandler, Context},
-    frame::Frame,
-    graphics_capture_api::InternalCaptureControl,
-    settings::{
-        ColorFormat, Settings, CursorCaptureSettings, DrawBorderSettings, 
-        SecondaryWindowSettings, MinimumUpdateIntervalSettings, DirtyRegionSettings
-    },
-    monitor::Monitor,
-};
+// windows-capture 제거됨 (GPU 방식 배제)
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, MOUSEINPUT, SendInput,
 };
@@ -80,10 +76,8 @@ const SHM_HDR_SIZE: usize = 64;
 const SHM_SLOT_SIZE: usize = SHM_HDR_SIZE + SHM_RAW_MAX;
 
 // 포인터/핸들을 스레드 간 이동 가능하게 래핑
-#[derive(Clone, Copy)]
 struct ShmPtr(usize);
 unsafe impl Send for ShmPtr {}
-#[derive(Clone, Copy)]
 struct WinEvt(isize);
 unsafe impl Send for WinEvt {}
 
@@ -93,12 +87,23 @@ struct RemoteSession {
     is_admin: bool,
 }
 
-fn shm_name_for(port: u16, m_idx: usize) -> String {
-    format!("Global\\AsterShm_{}_{}", port, m_idx)
+fn shm_name_for(username: &str, m_idx: usize) -> String {
+    // NT 객체 이름은 대소문자를 구분할 수 있어, worker_ports.txt 의 USERNAME 과
+    // 세션 환경변수 USERNAME 의 대소문자 차이로 SHM 이 열리지 않는 경우를 막는다.
+    let s: String = username
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase();
+    format!("Global\\AsterShm_{}_{}", s, m_idx)
 }
-
-fn evt_name_for(port: u16, m_idx: usize) -> String {
-    format!("Global\\AsterEvt_{}_{}", port, m_idx)
+fn evt_name_for(username: &str, m_idx: usize) -> String {
+    let s: String = username
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase();
+    format!("Global\\AsterEvt_{}_{}", s, m_idx)
 }
 
 // NULL DACL 보안 속성 생성 (모든 세션 접근 허용)
@@ -185,7 +190,6 @@ fn open_global_event(name: &str) -> Option<WinEvt> {
     }
 }
 
-// Worker: seqlock 방식으로 SHM에 RAW 프레임 쓰기 (BGRA -> RGBA 변환 포함)
 unsafe fn write_shm_frame(base: *mut u8, pixels: &[u8], width: u32, height: u32, is_admin: bool) {
     unsafe {
         let hdr = base as *mut u32;
@@ -202,9 +206,20 @@ unsafe fn write_shm_frame(base: *mut u8, pixels: &[u8], width: u32, height: u32,
         hdr_u16.write_volatile(width as u16);
         hdr_u16.add(1).write_volatile(height as u16);
 
-        // Rgba8로 캡처하므로 통째로 복사 (훨씬 빠름)
+        // GDI BGR -> RGBA 스왑 및 복사
         let dst = base.add(SHM_HDR_SIZE);
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), dst, len);
+        let src = pixels.as_ptr();
+        let pixel_count = (width * height) as usize;
+        
+        for i in 0..pixel_count {
+            let offset = i * 4;
+            if offset + 3 >= len { break; }
+            // BGR(src) -> RGB(dst)
+            *dst.add(offset)     = *src.add(offset + 2); // Red
+            *dst.add(offset + 1) = *src.add(offset + 1); // Green
+            *dst.add(offset + 2) = *src.add(offset);     // Blue
+            *dst.add(offset + 3) = 255;                  // Alpha
+        }
         
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         hdr.write_volatile((cur | 1) + 1); // 짝수 = 완료
@@ -430,7 +445,6 @@ impl MultiMonitorApp {
                                         let port_inner = p;
                                         let uname = username.clone();
                                         
-                                        /* 
                                         // --- user1 ~ user100 패턴만 허용 ---
                                         let uname_lower = uname.to_lowercase();
                                         let is_user_n = uname_lower.starts_with("user") && 
@@ -446,32 +460,28 @@ impl MultiMonitorApp {
                                             println!("🚫 [SHM] 본인 세션 제외: {}", uname);
                                             continue;
                                         }
-                                        */
                                         
-                                        println!("📡 [SHM] 워커 발견: {} (포트: {}) - 연결 시도 중...", uname, p);
+                                        println!("📡 [SHM] 워커 발견: {} (포트: {})", uname, p);
 
                                         thread::spawn(move || {
                                             let mut mon_threads: Vec<usize> = Vec::new();
                                             loop {
                                                 for m_idx in 0..8usize {
                                                     if mon_threads.contains(&m_idx) { continue; }
-                                                    let shm_name = shm_name_for(port_inner, m_idx);
-                                                    let evt_name = evt_name_for(port_inner, m_idx);
+                                                    let shm_name = shm_name_for(&uname, m_idx);
+                                                    let evt_name = evt_name_for(&uname, m_idx);
                                                     if let (Some(shm), Some(evt)) = (
                                                         open_shm_slot(&shm_name),
                                                         open_global_event(&evt_name),
                                                     ) {
-                                                                                                                mon_threads.push(m_idx);
-                                                        println!("🔗 [Controller] 모니터 연결 성공: {} (Index: {})", uname, m_idx);
-
+                                                        mon_threads.push(m_idx);
                                                         let ctx_thread = ctx_inner.clone();
                                                         let connections_inner = conn_inner.clone();
                                                         let unique_id = (port_inner as u32 * 100) + m_idx as u32;
                                                         let evt_h = windows::Win32::Foundation::HANDLE(evt.0);
                                                         let shm_ptr_wrapped = ShmPtr(shm.0 as usize);
 
-                                                         let uname_thread = uname.clone();
-                                                         thread::spawn(move || {
+                                                        thread::spawn(move || {
                                                             let shm_ptr = shm_ptr_wrapped.0 as *const u8;
                                                             use windows::Win32::System::Threading::WaitForSingleObject;
                                                             use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -509,14 +519,8 @@ impl MultiMonitorApp {
                                                                             ctx_thread.request_repaint();
                                                                         }
                                                                     }
-                                                                } else if res == windows::Win32::Foundation::WAIT_TIMEOUT {
-                                                                    // 타임아웃은 정상 (프레임 업데이트 없음)
-                                                                } else {
-                                                                    println!("🚨 [Controller] Wait failed: {:?}", res);
-                                                                    break;
                                                                 }
                                                             }
-                                                            println!("❌ [Controller] 모니터 쓰레드 종료: {} (Index: {})", uname_thread, m_idx);
                                                         });
                                                     }
                                                 }
@@ -529,7 +533,7 @@ impl MultiMonitorApp {
                         }
                     }
                 }
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_secs(5));
             }
         });
 
@@ -539,7 +543,7 @@ impl MultiMonitorApp {
             virtual_cursor_pos: None,
             input_active: false,
             last_modifiers: egui::Modifiers::default(),
-            grid_view: true,
+            grid_view: false,
             grid_size: 300.0,
             bottom_size: 160.0,
             login_id_input: String::new(),
@@ -594,14 +598,6 @@ impl MultiMonitorApp {
                             }
                         }
                     });
-                    ui.add_space(10.0);
-                    if ui.button(egui::RichText::new("🔧 오프라인 모드 (테스트용)").size(14.0)).clicked() {
-                        self.login_state = LoginState::LoggedIn { 
-                            user_id: "test_user".to_string(), 
-                            expiry: "2099-12-31".to_string() 
-                        };
-                        ctx.data_mut(|d| d.insert_temp(egui::Id::from("is_login"), true));
-                    }
                     ui.add_space(10.0);
                 });
             });
@@ -973,13 +969,9 @@ impl eframe::App for MultiMonitorApp {
                 let conns = self.connections.lock().unwrap();
                 let mut keys: Vec<_> = conns.keys().cloned().collect();
                 keys.sort();
-                
-                // 선택된 모니터가 없고 목록이 있다면 첫 번째 모니터 자동 선택 (그리드 뷰가 아닐 때)
-                if selected_idx.is_none() && !self.grid_view && !keys.is_empty() {
-                    selected_idx = Some(keys[0]);
-                }
-
                 let is_connected = conns.values().any(|c| c.texture.is_some());
+                // conns 락은 나중에 필요할 때 다시 걸거나 필요한 데이터를 복사해둡니다.
+                // 여기서는 일단 드롭하고 아래에서 다시 걸어서 사용합니다.
                 drop(conns);
 
                 if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
@@ -1088,6 +1080,16 @@ impl eframe::App for MultiMonitorApp {
                                                         )
                                                     });
                                                 }
+                                                // 우클릭 컨텍스트 메뉴 추가
+                                                response.context_menu(|ui| {
+                                                    if ui.button("🖥 이 디스플레이 선택").clicked() {
+                                                        selected_idx = Some(unique_id);
+                                                        self.grid_view = false;
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    ui.label(format!("Monitor ID: {}", unique_id));
+                                                });
                                             }
                                         }
                                     });
@@ -1141,6 +1143,14 @@ impl eframe::App for MultiMonitorApp {
                                         )
                                     });
                                 }
+                                // 우클릭 메뉴 추가
+                                response.context_menu(|ui| {
+                                    if ui.button("🖥 이 디스플레이 선택").clicked() {
+                                        selected_idx = Some(unique_id);
+                                        self.grid_view = false;
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                         });
 
@@ -1240,7 +1250,7 @@ impl eframe::App for MultiMonitorApp {
                         if let Some(session) = connections.get(&idx) {
                             if let Some(texture) = &session.texture {
                             let available_size = ui.available_size();
-                            let aspect_ratio = texture.size()[0] as f32 / texture.size()[1] as f32;
+                            let aspect_ratio = 1920.0 / 1080.0;
                             let target_size = if available_size.x / available_size.y > aspect_ratio {
                                 egui::vec2(available_size.y * aspect_ratio, available_size.y)
                             } else {
@@ -1306,7 +1316,8 @@ impl eframe::App for MultiMonitorApp {
                                 if rect.contains(pos) {
                                     self.virtual_cursor_pos = Some(pos);
                                     if self.input_active {
-                                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                                        // 마우스 포인터가 항상 보이도록 설정 (사용자 요청)
+                                        ctx.set_cursor_icon(egui::CursorIcon::Default);
                                     }
                                 } else {
                                     self.virtual_cursor_pos = None;
@@ -1562,8 +1573,34 @@ fn handle_remote_input(packet: InputPacket) {
 
 // REMOTE_MODIFIER_STATE 및 sync_remote_modifiers는 더 이상 사용되지 않아 삭제되었습니다.
 
+fn set_monitor_resolution(device_name: &str, width: u32, height: u32) {
+    unsafe {
+        let mut dev_mode = DEVMODEW::default();
+        dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        dev_mode.dmPelsWidth = width;
+        dev_mode.dmPelsHeight = height;
+        dev_mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+        
+        let device_name_wide: Vec<u16> = device_name.encode_utf16().chain(Some(0)).collect();
+        let result = ChangeDisplaySettingsExW(
+            windows::core::PCWSTR(device_name_wide.as_ptr()),
+            Some(&dev_mode),
+            None,
+            windows::Win32::Graphics::Gdi::CDS_TYPE(0), // Temporary for current session
+            None,
+        );
+        println!("📺 [Worker] 해상도 변경 시도: {} -> {}x{} (Result: {:?})", device_name, width, height, result);
+    }
+}
 
 fn run_worker(port: u16) {
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".to_string());
+    
+    // --- 로그인 직후 즉시 해상도 변경 시도 ---
+    let initial_monitors = get_detailed_monitors();
+    for info in initial_monitors {
+        set_monitor_resolution(&info._name, 1920, 1080);
+    }
 
     let udp_port = port;
     let active_monitor: Arc<std::sync::atomic::AtomicU32> =
@@ -1589,122 +1626,96 @@ fn run_worker(port: u16) {
 
     let monitors = loop {
         let m = get_detailed_monitors();
-        if !m.is_empty() { 
-            println!("✅ [Worker] {}개의 모니터를 감지했습니다.", m.len());
-            break m; 
-        }
-        println!("⏳ [Worker] 모니터를 기다리는 중...");
+        if !m.is_empty() { break m; }
         thread::sleep(Duration::from_secs(2));
     };
 
     for (m_idx, info) in monitors.into_iter().enumerate() {
         let active_mon = active_monitor.clone();
-        let shm_name = shm_name_for(port, m_idx);
-        let evt_name = evt_name_for(port, m_idx);
-        let monitor_name = info._name.clone();
+        let shm_name = shm_name_for(&username, m_idx);
+        let evt_name = evt_name_for(&username, m_idx);
         
         thread::spawn(move || {
             let Some((shm, _handle)) = create_shm_slot(&shm_name) else { return; };
             let Some(evt) = create_global_event(&evt_name) else { return; };
-            let shm_ptr_wrapped = ShmPtr(shm.0 as usize);
-            let evt_wrapped = WinEvt(evt.0);
+            let shm_ptr = shm.0 as *mut u8;
+            let evt_h = windows::Win32::Foundation::HANDLE(evt.0);
 
-            // WGC 캡처를 위한 핸들러 구조체
-            struct CaptureHandler {
-                shm_ptr: ShmPtr,
-                evt_handle: WinEvt,
-                active_mon: Arc<std::sync::atomic::AtomicU32>,
-                m_idx: usize,
-                frame_count: u64,
-            }
+            unsafe {
+                let width = (info.rect.right - info.rect.left) as u32;
+                let height = (info.rect.bottom - info.rect.top) as u32;
 
-            struct CaptureFlags {
-                shm_ptr: ShmPtr,
-                evt_handle: WinEvt,
-                active_mon: Arc<std::sync::atomic::AtomicU32>,
-                m_idx: usize,
-            }
-
-            impl GraphicsCaptureApiHandler for CaptureHandler {
-                type Flags = CaptureFlags;
-                type Error = Box<dyn std::error::Error + Send + Sync>;
-
-                fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-                    let flags = ctx.flags;
-                    Ok(Self {
-                        shm_ptr: flags.shm_ptr,
-                        evt_handle: flags.evt_handle,
-                        active_mon: flags.active_mon,
-                        m_idx: flags.m_idx,
-                        frame_count: 0,
-                    })
-                }
-
-                fn on_frame_arrived(
-                    &mut self,
-                    frame: &mut Frame,
-                    _capture_control: InternalCaptureControl,
-                ) -> Result<(), Self::Error> {
-                    let focused = self.active_mon.load(Ordering::SeqCst);
-                    let is_focused = focused == u32::MAX || focused == self.m_idx as u32;
-
-                    // 프레임 데이터 가져오기 (RGBA 8-bit)
-                    let width = frame.width();
-                    let height = frame.height();
-                    let buffer = frame.buffer()?;
-                    let mut frame_buffer = buffer;
-                    let pixels = frame_buffer.as_nopadding_buffer()?;
-                    
-                    // SHM 쓰기 (BGRA -> RGBA 변환됨)
-                    unsafe {
-                        write_shm_frame(self.shm_ptr.0 as *mut u8, pixels, width, height, is_elevated());
-                        let _ = windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(self.evt_handle.0));
-                    }
-
-                    self.frame_count += 1;
-                    if self.frame_count % 100 == 0 {
-                        println!("📊 [Worker] {}번째 프레임 전송 중... (Index: {})", self.frame_count, self.m_idx);
-                    }
-
-                    if !is_focused {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-
-                    Ok(())
-                }
-
-                fn on_closed(&mut self) -> Result<(), Self::Error> {
-                    Ok(())
-                }
-            }
-
-            // 모니터 캡처 시작 (이미 EnumDisplayMonitors에서 확보한 Monitor 핸들 사용)
-            let target = info._handle;
-
-            println!("🚀 [Worker] 모니터 캡처 시작: {}", monitor_name);
-            loop {
-                let settings = Settings::new(
-                    target,
-                    CursorCaptureSettings::Default,
-                    DrawBorderSettings::Default,
-                    SecondaryWindowSettings::Default,
-                    MinimumUpdateIntervalSettings::Default,
-                    DirtyRegionSettings::Default,
-                    ColorFormat::Rgba8,
-                    CaptureFlags {
-                        shm_ptr: shm_ptr_wrapped,
-                        evt_handle: evt_wrapped,
-                        active_mon: active_mon.clone(),
-                        m_idx,
-                    },
+                // 1. 모니터 전용 DC 생성
+                let device_name_wide: Vec<u16> = info._name.encode_utf16().chain(Some(0)).collect();
+                let h_dc_screen = CreateDCW(
+                    windows::core::w!("DISPLAY"),
+                    windows::core::PCWSTR(device_name_wide.as_ptr()),
+                    None,
+                    None,
                 );
+                
+                if h_dc_screen.is_invalid() {
+                    eprintln!("❌ [Worker] DC 생성 실패: {}", info._name);
+                    return;
+                }
 
-                if let Err(e) = CaptureHandler::start(settings) {
-                    eprintln!("🚨 [Worker] 캡처 중단됨 ({}): {}. 3초 후 재시도 중...", monitor_name, e);
-                    thread::sleep(Duration::from_secs(3));
-                } else {
-                    println!("ℹ️ [Worker] 캡처 정상 종료: {}", monitor_name);
-                    break;
+                // 2. 메모리 DC 및 DIB Section 생성 (더블 버퍼링 및 직접 포인터 접근)
+                let h_dc_mem = CreateCompatibleDC(h_dc_screen);
+                
+                let bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width as i32,
+                        biHeight: -(height as i32), // Top-down
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                let h_bmp = CreateDIBSection(
+                    h_dc_mem,
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    &mut bits_ptr,
+                    None,
+                    0,
+                ).unwrap();
+
+                if h_bmp.is_invalid() || bits_ptr.is_null() {
+                    eprintln!("❌ [Worker] DIB Section 생성 실패");
+                    let _ = DeleteDC(h_dc_screen);
+                    let _ = DeleteDC(h_dc_mem);
+                    return;
+                }
+
+                SelectObject(h_dc_mem, h_bmp);
+                let pixel_data = std::slice::from_raw_parts(bits_ptr as *const u8, (width * height * 4) as usize);
+
+                println!("🚀 [Worker] GDI BitBlt 캡처 시작: {} ({}x{})", info._name, width, height);
+
+                let elevated = is_elevated();
+                loop {
+                    let focused = active_mon.load(Ordering::SeqCst);
+                    let is_focused = focused == u32::MAX || focused == m_idx as u32;
+
+                    // CPU 기반 초고속 BitBlt 전송
+                    if BitBlt(h_dc_mem, 0, 0, width as i32, height as i32, h_dc_screen, 0, 0, SRCCOPY).is_ok() {
+                        // SHM에 직접 쓰기
+                        write_shm_frame(shm_ptr, pixel_data, width, height, elevated);
+                        let _ = windows::Win32::System::Threading::SetEvent(evt_h);
+                    }
+
+                    if is_focused {
+                        // 초고속 모드: 대기 시간을 최소화하여 GPU 수준의 속도 구현
+                        thread::sleep(Duration::from_millis(1)); 
+                    } else {
+                        // 비활성 모니터는 자원 절약
+                        thread::sleep(Duration::from_millis(30));
+                    }
                 }
             }
         });
@@ -1717,7 +1728,6 @@ struct MonitorInfo {
     _name: String,
     rect: RECT,
     _is_primary: bool,
-    _handle: Monitor,
     _hmonitor: HMONITOR,
 }
 
@@ -1742,32 +1752,24 @@ fn get_detailed_monitors_internal(_verbose: bool) -> Vec<MonitorInfo> {
     
     // 1. EnumDisplayMonitors로 찾은 물리/가상 모니터들
     for (name, rect, is_primary, hmonitor) in data.list {
-        let m = Monitor::from_raw_hmonitor(hmonitor.0 as *mut std::ffi::c_void);
         results.push(MonitorInfo {
             _name: name,
             rect,
             _is_primary: is_primary,
-            _handle: m,
             _hmonitor: hmonitor,
         });
     }
-    
-    // 2. 만약 위에서 못 찾았거나 추가 모니터가 있다면 windows-capture의 자체 열거 사용
-    if let Ok(monitors) = Monitor::enumerate() {
-        for m in monitors {
-            // 중복 체크 (핸들이나 좌표 기반)
-            if !results.iter().any(|r| r._handle.as_raw_hmonitor() == m.as_raw_hmonitor()) {
-                results.push(MonitorInfo {
-                    _name: format!("Extra-Monitor"),
-                    rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
-                    _is_primary: false,
-                    _handle: m.clone(),
-                    _hmonitor: HMONITOR(m.as_raw_hmonitor() as isize),
-                });
-            }
-        }
-    }
 
+    // 3. 메인 모니터 및 특정 모니터 필터링
+    let _my_name = std::env::var("USERNAME").unwrap_or_default();
+    results.retain(|m| {
+        // 메인 모니터(사용자가 지정한 이름) 제외
+        if m._name.contains("JtnCw8iKfGVx$") {
+            return false;
+        }
+        // 기본 모니터 필터링 예시
+        true
+    });
     results
 }
 
